@@ -1,6 +1,8 @@
-from configparser import RawConfigParser, NoSectionError, SectionProxy, _default_dict
+from configparser import RawConfigParser, NoSectionError, _default_dict
 from configparser import DuplicateSectionError, DuplicateOptionError, MissingSectionHeaderError
 from collections import ChainMap, defaultdict, deque
+from collections.abc import MutableMapping
+import functools
 from typing import Any
 import sys
 
@@ -16,14 +18,80 @@ class LekvarParameter:
     def __repr__(self):
         return self._value.__repr__()
 
+class LekvarSectionProxy(MutableMapping):
+    def __init__(self, parser, name):
+        self._parser = parser
+        self._name = name
+        for conv in parser.converters:
+            key = 'get' + conv
+            getter = functools.partial(self.get, _impl=getattr(parser, key))
+            setattr(self, key, getter)
+
+    def __repr__(self):
+        return '<Section: {}>'.format(self._name)
+
+    def __getitem__(self, key):
+        if not self._parser.has_option(self._name, key):
+            raise KeyError(key)
+        return self._parser.get(self._name, key)
+
+    def __setitem__(self, key, value):
+        self._parser._validate_value_types(option=key, value=value)
+        return self._parser.set(self._name, key, value)
+
+    def __delitem__(self, key):
+        if not (self._parser.has_option(self._name, key) and
+                self._parser.remove_option(self._name, key)):
+            raise KeyError(key)
+
+    def __contains__(self, key):
+        return self._parser.has_option(self._name, key)
+
+    def __len__(self):
+        return len(self._options())
+
+    def __iter__(self):
+        return self._options().__iter__()
+    
+    def _options(self):
+        if self._name != self._parser.default_section:
+            return self._parser.options(self._name)
+        else:
+            return self._parser.defaults()
+
+    @property
+    def parser(self):
+        # The parser object of the proxy is read-only.
+        return self._parser
+
+    @property
+    def name(self):
+        # The name of the section on a proxy is read-only.
+        return self._name
+
+    def get(self, option, fallback=None, *, raw=False, vars=None,
+            _impl=None, **kwargs):
+        """Get an option value.
+
+        Unless `fallback` is provided, `None` will be returned if the option
+        is not found.
+
+        """
+        # If `_impl` is provided, it should be a getter method on the parser
+        # object that provides the desired type conversion.
+        if not _impl:
+            _impl = self._parser.get
+        return _impl(self._name, option, raw=raw, vars=vars,
+                     fallback=fallback, **kwargs)
 
 class Lekvar(RawConfigParser):
     
     def __init__(self): 
         super().__init__()
-        self._proxy_tree = _default_dict()
+        self._proxy_tree: _default_dict[str, str] = _default_dict()
         self._proxy_inheritance = _default_dict()
         self._param_dict = _default_dict()
+        self._options = _default_dict()
 
     def __getitem__(self, __name: str) -> Any:
         if __name == self.default_section:
@@ -161,3 +229,123 @@ class Lekvar(RawConfigParser):
         else:
             option = self.optionxform(option)
             return option in self.options(section)
+        
+    def add_section(self, section):
+        """Create a new section in the configuration.
+
+        Raise DuplicateSectionError if a section by the specified name
+        already exists. Raise ValueError if name is DEFAULT.
+        """
+        if section == self.default_section:
+            raise ValueError('Invalid section name: %r' % section)
+
+        if section in self._sections:
+            raise DuplicateSectionError(section)
+        self._sections[section] = self._dict()
+        self._proxies[section] = LekvarSectionProxy(self, section)
+        
+    def _read(self, fp, fpname):
+        elements_added = set()
+        cursect = None                        # None, or a dictionary
+        sectname = None
+        optname = None
+        lineno = 0
+        indent_level = 0
+        e = None                              # None, or an exception
+        for lineno, line in enumerate(fp, start=1):
+            comment_start = sys.maxsize
+            # strip inline comments
+            inline_prefixes = {p: -1 for p in self._inline_comment_prefixes}
+            while comment_start == sys.maxsize and inline_prefixes:
+                next_prefixes = {}
+                for prefix, index in inline_prefixes.items():
+                    index = line.find(prefix, index+1)
+                    if index == -1:
+                        continue
+                    next_prefixes[prefix] = index
+                    if index == 0 or (index > 0 and line[index-1].isspace()):
+                        comment_start = min(comment_start, index)
+                inline_prefixes = next_prefixes
+            # strip full line comments
+            for prefix in self._comment_prefixes:
+                if line.strip().startswith(prefix):
+                    comment_start = 0
+                    break
+            if comment_start == sys.maxsize:
+                comment_start = None
+            value = line[:comment_start].strip()
+            if not value:
+                if self._empty_lines_in_values:
+                    # add empty line to the value, but only if there was no
+                    # comment on the line
+                    if (comment_start is None and
+                        cursect is not None and
+                        optname and
+                        cursect[optname] is not None):
+                        cursect[optname].append('') # newlines added at join
+                else:
+                    # empty line marks end of value
+                    indent_level = sys.maxsize
+                continue
+            # continuation line?
+            first_nonspace = self.NONSPACECRE.search(line)
+            cur_indent_level = first_nonspace.start() if first_nonspace else 0
+            if (cursect is not None and optname and
+                cur_indent_level > indent_level):
+                cursect[optname].append(value)
+            # a section header or option header?
+            else:
+                indent_level = cur_indent_level
+                # is it a section header?
+                mo = self.SECTCRE.match(value)
+                if mo:
+                    sectname = mo.group('header')
+                    if sectname in self._sections:
+                        if self._strict and sectname in elements_added:
+                            raise DuplicateSectionError(sectname, fpname,
+                                                        lineno)
+                        cursect = self._sections[sectname]
+                        elements_added.add(sectname)
+                    elif sectname == self.default_section:
+                        cursect = self._defaults
+                    else:
+                        cursect = self._dict()
+                        self._sections[sectname] = cursect
+                        self._proxies[sectname] = LekvarSectionProxy(self, sectname)
+                        elements_added.add(sectname)
+                    # So sections can't start with a continuation line
+                    optname = None
+                # no section header in the file?
+                elif cursect is None:
+                    raise MissingSectionHeaderError(fpname, lineno, line)
+                # an option line?
+                else:
+                    mo = self._optcre.match(value)
+                    if mo:
+                        optname, vi, optval = mo.group('option', 'vi', 'value')
+                        if not optname:
+                            e = self._handle_error(e, fpname, lineno, line)
+                        optname = self.optionxform(optname.rstrip())
+                        if (self._strict and
+                            (sectname, optname) in elements_added):
+                            raise DuplicateOptionError(sectname, optname,
+                                                       fpname, lineno)
+                        elements_added.add((sectname, optname))
+                        # This check is fine because the OPTCRE cannot
+                        # match if it would set optval to None
+                        if optval is not None:
+                            optval = optval.strip()
+                            cursect[optname] = [optval]
+                        else:
+                            # valueless option handling
+                            cursect[optname] = None
+                    else:
+                        # a non-fatal parsing error occurred. set up the
+                        # exception but keep going. the exception will be
+                        # raised at the end of the file and will contain a
+                        # list of all bogus lines
+                        e = self._handle_error(e, fpname, lineno, line)
+        self._join_multiline_values()
+        # if any parsing errors occurred, raise an exception
+        if e:
+            raise e
