@@ -4,6 +4,19 @@ from collections import ChainMap, defaultdict, deque
 from typing import Any
 import sys
 
+class LekvarParameter:
+    def __init__(self, name, value):
+        self._name = name
+        self._value = value
+        self._locations = deque()
+
+    def __str__(self):
+        return self._value.__str__()
+    
+    def __repr__(self):
+        return self._value.__repr__()
+
+
 class Lekvar(RawConfigParser):
     
     def __init__(self): 
