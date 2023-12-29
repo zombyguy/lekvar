@@ -1,114 +1,88 @@
-from configparser import RawConfigParser, NoSectionError, _default_dict
-from configparser import DuplicateSectionError, DuplicateOptionError, MissingSectionHeaderError
+from configparser import (
+    RawConfigParser,
+    SectionProxy,
+
+    Error,
+    ParsingError,
+    NoOptionError,
+    NoSectionError,
+    InterpolationError,
+    DuplicateOptionError,
+    DuplicateSectionError,
+    InterpolationDepthError,
+    InterpolationSyntaxError,
+    MissingSectionHeaderError,
+    InterpolationMissingOptionError,
+
+    _default_dict,
+    DEFAULTSECT,
+    _UNSET
+)
 from collections import ChainMap, defaultdict, deque
-from collections.abc import MutableMapping
+from .composemap import ComposeMutMap
 import functools
-from typing import Any
+import itertools
+from typing import Any, TextIO
 import sys
+import re
+import warnings
 
-class LekvarParameter:
-    def __init__(self, name, value):
-        self._name = name
-        self._value = value
-        self._locations = deque()
-
-    def __str__(self):
-        return self._value.__str__()
-    
-    def __repr__(self):
-        return self._value.__repr__()
-
-class LekvarSectionProxy(MutableMapping):
-    def __init__(self, parser, name):
-        self._parser = parser
-        self._name = name
-        for conv in parser.converters:
-            key = 'get' + conv
-            getter = functools.partial(self.get, _impl=getattr(parser, key))
-            setattr(self, key, getter)
-
-    def __repr__(self):
-        return '<Section: {}>'.format(self._name)
-
-    def __getitem__(self, key):
-        if not self._parser.has_option(self._name, key):
-            raise KeyError(key)
-        return self._parser.get(self._name, key)
-
-    def __setitem__(self, key, value):
-        self._parser._validate_value_types(option=key, value=value)
-        return self._parser.set(self._name, key, value)
-
-    def __delitem__(self, key):
-        if not (self._parser.has_option(self._name, key) and
-                self._parser.remove_option(self._name, key)):
-            raise KeyError(key)
-
-    def __contains__(self, key):
-        return self._parser.has_option(self._name, key)
-
-    def __len__(self):
-        return len(self._options())
-
-    def __iter__(self):
-        return self._options().__iter__()
-    
-    def _options(self):
-        if self._name != self._parser.default_section:
-            return self._parser.options(self._name)
-        else:
-            return self._parser.defaults()
-
-    @property
-    def parser(self):
-        # The parser object of the proxy is read-only.
-        return self._parser
-
-    @property
-    def name(self):
-        # The name of the section on a proxy is read-only.
-        return self._name
-
-    def get(self, option, fallback=None, *, raw=False, vars=None,
-            _impl=None, **kwargs):
-        """Get an option value.
-
-        Unless `fallback` is provided, `None` will be returned if the option
-        is not found.
-
-        """
-        # If `_impl` is provided, it should be a getter method on the parser
-        # object that provides the desired type conversion.
-        if not _impl:
-            _impl = self._parser.get
-        return _impl(self._name, option, raw=raw, vars=vars,
-                     fallback=fallback, **kwargs)
+class SectionInheritanceError(Error): ...
 
 class Lekvar(RawConfigParser):
-    
-    def __init__(self): 
-        super().__init__()
-        self._proxy_tree: _default_dict[str, str] = _default_dict()
-        self._proxy_inheritance = _default_dict()
-        self._param_dict = _default_dict()
-        self._options = _default_dict()
+    _SECT_TMPL = r"""
+        \[                          # ex.: [ q.w.e.asd : b,c,d]
+        (?P<header>                 # header: ' q.w.e.asd '
+        ((?P<base>[^:]+)\.)?        # base: ' q.w.e'
+        (?P<head>[^:\.]+)           # head: 'asd '
+        )
+        (:(?P<inherit>.*))?         # inherit: ' b,c,d'
+        \]
+        """
+    _OPT_TMPL = r"""                # ex.: ' a > b = 123'
+        (?P<option>.*?)             # option: ' a'
+        (\s*>\s*
+        (?P<to_head>[^{delim}]+)    # to_head: 'b ' 
+        )?
+        \s*(?P<vi>{delim})\s*       # vi: '=' 
+        (?P<value>.*)$              # value: '123'
+        """
+    # _OPT_NV_TMPL = r""" # TODO
 
-    def __getitem__(self, __name: str) -> Any:
-        if __name == self.default_section:
-            return self._defaults.copy()
-        if __name not in self._sections.keys(): 
-            raise KeyError
+    SECTCRE = re.compile(_SECT_TMPL, re.VERBOSE)
+    OPTCRE = re.compile(_OPT_TMPL.format(delim="=|:"), re.VERBOSE)
+    # OPTCRE_NV = re.compile(_OPT_NV_TMPL.format(delim="=|:"), re.VERBOSE)
+    NONSPACECRE = re.compile(r"\S")
+    BOOLEAN_STATES = {'1': True, 'yes': True, 'true': True, 'on': True,
+                      '0': False, 'no': False, 'false': False, 'off': False}
+    
+    def __init__(self, defaults=None, dict_type=_default_dict,
+                 allow_no_value=False, *, delimiters=('=', ':'),
+                 comment_prefixes=('#', ';'), inline_comment_prefixes=None,
+                 strict=True, empty_lines_in_values=True,
+                 default_section=DEFAULTSECT,
+                 interpolation=_UNSET, converters=_UNSET):
         
-        # TODO: this doesnt work with yet
-        # TODO: probably has a lot of bugs
-        final = self._defaults.copy()
-        for name in self._proxy_inheritance[__name]:
-            current = name
-            while current != self.default_section:
-                #print("Getting tags for ", ".".join(tags[:i+1]))
-                final = {**self._sections[current], **final}
-                current = self._proxy_tree[current]
-        return final
+        super().__init__(
+            defaults, dict_type, allow_no_value, 
+            delimiters = delimiters,
+            comment_prefixes = comment_prefixes, 
+            inline_comment_prefixes = inline_comment_prefixes,
+            strict = strict, 
+            empty_lines_in_values = empty_lines_in_values,
+            default_section = default_section,
+            interpolation = interpolation, 
+            converters = converters)
+        # TODO: maybe should just initialize it myself
+        
+        self._all_options = self._dict()
+        self._defaults: ComposeMutMap = ComposeMutMap(self._dict(), self._all_options)
+        self._sections: dict[str, ComposeMutMap] = self._dict()
+
+        self._proxy_tree: dict[str, str] = self._dict()
+        self._proxy_inheritance: dict[str, deque] = self._dict()
+        
+        self._inherit_fw = self._dict()
     
     def _resolve_inline_inheritance(self):
         to_be_created = defaultdict(dict)
@@ -135,42 +109,6 @@ class Lekvar(RawConfigParser):
             
             section_dict = self._sections[section_name]
             self._sections[section_name] = {**new_section_dict, **section_dict}
-            
-
-    def _build_tree(self):
-        self._proxy_tree = {self.default_section: None}
-        for name in self._proxies.keys():
-            self._assign_parent_proxy(name)
-
-    def _assign_parent_proxy(self, name):
-        if name in self._proxy_tree.keys(): return
-
-        i = name.rfind(".")
-        if i == -1: self._proxy_tree[name] = self.default_section; return
-        
-        parent = name[:i]
-        self._proxy_tree[name] = parent
-        if parent not in self._proxies.keys():
-            self.add_section(parent)
-            self._assign_parent_proxy(parent)
-    
-    def _unify_values(self, section, vars):
-        map_order = []
-        current = section
-        try: 
-            while current != self.default_section:
-                map_order.append(self._sections[current])
-                current = self._proxy_tree[current]
-        except KeyError:
-            if section != self.default_section:
-                raise NoSectionError(section) from None
-        vardict = {}
-        if vars:
-            for key, value in vars.items():
-                if value is not None:
-                    value = str(value)
-                vardict[self.optionxform(key)] = value
-        return ChainMap(vardict, *map_order, self._defaults)
     
     def _resolve_section_names(self):
         to_be_deleted = []
@@ -207,54 +145,118 @@ class Lekvar(RawConfigParser):
             if sec in self._sections.keys(): continue
             self.add_section(sec)
 
-
-    def options(self, section):
-        opts = dict()
-        current = section
-        try:
-            while current != self.default_section:
-                opts = {**self._sections[current], **opts}
-                current = self._proxy_tree[current]
-        except KeyError:
-            raise NoSectionError(section) from None
-        opts = {**self._defaults, **opts}
-        return list(opts.keys())
-    
-    def has_option(self, section: str, option: str) -> bool:
-        if not section or section == self.default_section:
-            option = self.optionxform(option)
-            return option in self._defaults
-        elif section not in self._sections:
-            return False
-        else:
-            option = self.optionxform(option)
-            return option in self.options(section)
-        
     def add_section(self, section):
-        """Create a new section in the configuration.
-
-        Raise DuplicateSectionError if a section by the specified name
-        already exists. Raise ValueError if name is DEFAULT.
-        """
         if section == self.default_section:
             raise ValueError('Invalid section name: %r' % section)
 
         if section in self._sections:
             raise DuplicateSectionError(section)
-        self._sections[section] = self._dict()
-        self._proxies[section] = LekvarSectionProxy(self, section)
+        self._sections[section] = ComposeMutMap(self._dict(), self._all_options)
+        self._proxies[section] = SectionProxy(self, section)
+
+    def options(self, section):
+        try:
+            opts = self._sections[section]
+        except KeyError:
+            raise NoSectionError(section) from None
+        return list(opts.keys())
+
+    def get(self, section, option, *, raw=False, vars=None, fallback=_UNSET):
+        if section == self.default_section:
+            section_dict = self._defaults
+        else: 
+            try:
+                section_dict = self._sections[section]
+            except KeyError:
+                if fallback is _UNSET:
+                    raise NoSectionError(section)
+                else:
+                    return fallback
         
-    def _read(self, fp, fpname):
+        try: 
+            value = section_dict[option]
+        except KeyError:
+            if fallback is _UNSET:
+                raise NoOptionError(option, section)
+            else: 
+                return fallback
+        
+        if raw or value is None:
+            return value
+        else: 
+            # TODO: Interpolation
+            return value
+
+    def items(self, section=_UNSET, raw=False, vars=None):
+        if section is _UNSET: 
+            return super().items()
+        # TODO: everything else
+        #return super().items(section, raw, vars)
+
+    def popitem(self):
+        # TODO: only the leafs should be able to pop
+        return super().popitem()
+    
+    def set(self, section, option, value=None, in_read = False):
+        # TODO: interpolation
+                
+        if not section or section == self.default_section:
+            sectdict = self._defaults
+            section = ''
+        else:
+            try:
+                sectdict = self._sections[section]
+            except KeyError:
+                raise NoSectionError(section) from None
+        
+        rel_opt = self.optionxform(option.strip())
+        abs_opt = f"{section}.{rel_opt}"
+
+        sectdict.dict_1[rel_opt] = abs_opt
+        if value == None:
+            sectdict.dict_2[abs_opt] = None
+        else:
+            sectdict.dict_2[abs_opt] = value if not in_read else [value]
+        
+    def write(self, fp, space_around_delimiters=True):
+        # TODO: writing is tricky
+        raise NotImplementedError
+        return super().write(fp, space_around_delimiters)
+    
+    def remove_option(self, section, option):
+        # TODO: DAG
+        raise NotImplementedError
+        return super().remove_option(section, option)
+
+    def remove_section(self, section):
+        # TODO: DAG
+        raise NotImplementedError
+        return super().remove_section(section)
+    
+    def __setitem__(self, key, value):
+        raise NotImplementedError
+    
+    def __delitem__(self, key):
+        raise NotImplementedError
+
+    def __len__(self):
+        # TODO: what is the logical length, when we account for inheritance?
+        return super().__len__()
+
+
+    def _read(self, fp: TextIO, fpname: str):
         elements_added = set()
-        cursect = None                        # None, or a dictionary
+        curproxy: SectionProxy | None = None                        # None, or a dictionary
         sectname = None
+        to_sect = None
         optname = None
         lineno = 0
         indent_level = 0
-        e = None                              # None, or an exception
+        e: Exception | None = None
         for lineno, line in enumerate(fp, start=1):
             comment_start = sys.maxsize
             # strip inline comments
+            # TODO: interesting logic, might rewrite, regexify
             inline_prefixes = {p: -1 for p in self._inline_comment_prefixes}
             while comment_start == sys.maxsize and inline_prefixes:
                 next_prefixes = {}
@@ -279,10 +281,10 @@ class Lekvar(RawConfigParser):
                     # add empty line to the value, but only if there was no
                     # comment on the line
                     if (comment_start is None and
-                        cursect is not None and
+                        curproxy is not None and
                         optname and
-                        cursect[optname] is not None):
-                        cursect[optname].append('') # newlines added at join
+                        self._all_options[f"{to_sect}.{optname}"] is not None):
+                        self._all_options[f"{to_sect}.{optname}"].append('') # newlines added at join
                 else:
                     # empty line marks end of value
                     indent_level = sys.maxsize
@@ -290,55 +292,53 @@ class Lekvar(RawConfigParser):
             # continuation line?
             first_nonspace = self.NONSPACECRE.search(line)
             cur_indent_level = first_nonspace.start() if first_nonspace else 0
-            if (cursect is not None and optname and
+            if (curproxy is not None and optname and
                 cur_indent_level > indent_level):
-                cursect[optname].append(value)
+                self._all_options[f"{to_sect}.{optname}"].append(value)
             # a section header or option header?
             else:
                 indent_level = cur_indent_level
                 # is it a section header?
                 mo = self.SECTCRE.match(value)
                 if mo:
-                    sectname = mo.group('header')
-                    if sectname in self._sections:
-                        if self._strict and sectname in elements_added:
-                            raise DuplicateSectionError(sectname, fpname,
-                                                        lineno)
-                        cursect = self._sections[sectname]
-                        elements_added.add(sectname)
-                    elif sectname == self.default_section:
-                        cursect = self._defaults
-                    else:
-                        cursect = self._dict()
-                        self._sections[sectname] = cursect
-                        self._proxies[sectname] = LekvarSectionProxy(self, sectname)
+                    header, base, head, inherit = mo.group('header', 'base', 'head', 'inherit')
+                    header = header.strip()
+                    if header == self.default_section:
+                        curproxy = self._proxies[self.default_section]
+                        sectname = ''
+                        if inherit != None: 
+                            raise SectionInheritanceError("Default section cannot inherit.")
+                    else: 
+                        sectname = header
+                        self.add_section(sectname)
+                        curproxy = self._proxies[sectname]
                         elements_added.add(sectname)
                     # So sections can't start with a continuation line
                     optname = None
                 # no section header in the file?
-                elif cursect is None:
+                elif sectname is None:
                     raise MissingSectionHeaderError(fpname, lineno, line)
                 # an option line?
                 else:
                     mo = self._optcre.match(value)
                     if mo:
-                        optname, vi, optval = mo.group('option', 'vi', 'value')
+                        optname, to_head, vi, optval = mo.group('option', 'to_head', 'vi', 'value')
                         if not optname:
                             e = self._handle_error(e, fpname, lineno, line)
+                        if to_head is not None:
+                            to_sect = f"{sectname}.{to_head.strip()}"
+                            if to_sect not in self._sections:
+                                self.add_section(to_sect)
+                        else: 
+                            to_sect = sectname
                         optname = self.optionxform(optname.rstrip())
                         if (self._strict and
-                            (sectname, optname) in elements_added):
-                            raise DuplicateOptionError(sectname, optname,
+                            (to_sect, optname) in elements_added):
+                            raise DuplicateOptionError(to_sect, optname,
                                                        fpname, lineno)
-                        elements_added.add((sectname, optname))
-                        # This check is fine because the OPTCRE cannot
-                        # match if it would set optval to None
-                        if optval is not None:
-                            optval = optval.strip()
-                            cursect[optname] = [optval]
-                        else:
-                            # valueless option handling
-                            cursect[optname] = None
+                        elements_added.add((to_sect, optname))
+                        self.set(to_sect, optname, optval, True)
+                        # TODO: value type parsing
                     else:
                         # a non-fatal parsing error occurred. set up the
                         # exception but keep going. the exception will be
@@ -349,3 +349,16 @@ class Lekvar(RawConfigParser):
         # if any parsing errors occurred, raise an exception
         if e:
             raise e
+
+
+    def _join_multiline_values(self):
+        for name, val in self._all_options.items():
+            if isinstance(val, list):
+                val = '\n'.join(val).rstrip()
+                self._all_options[name] = val
+            # TODO: interpolation
+            # self._all_options[name] = self._interpolation.before_read(self, section, name, val)
+
+    def _unify_values(self, section, vars):
+        warnings.warn("Under normal operaion of 'Lekvar', this is never called.")
+        return super()._unify_values(section, vars)
