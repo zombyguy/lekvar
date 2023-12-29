@@ -1,93 +1,29 @@
-from configparser import RawConfigParser, NoSectionError, _default_dict
-from configparser import DuplicateSectionError, DuplicateOptionError, MissingSectionHeaderError
+from configparser import (
+    RawConfigParser,
+    SectionProxy,
+
+    ParsingError,
+    NoOptionError,
+    NoSectionError,
+    InterpolationError,
+    DuplicateOptionError,
+    DuplicateSectionError,
+    InterpolationDepthError,
+    InterpolationSyntaxError,
+    MissingSectionHeaderError,
+    InterpolationMissingOptionError,
+
+    _default_dict,
+    DEFAULTSECT,
+    _UNSET
+)
 from collections import ChainMap, defaultdict, deque
-from collections.abc import MutableMapping
+from .composemap import ComposeMap
 import functools
 from typing import Any, TextIO
 import sys
 import re
 
-class LekvarParameter:
-    def __init__(self, name, value):
-        self._name: str = name
-        self._value = value
-        self._locations = deque()
-
-    def __str__(self):
-        return self._value.__str__()
-    
-    def __repr__(self):
-        return self._value.__repr__()
-
-class LekvarSectionProxy(MutableMapping):
-    def __init__(self, parser, name):
-        self._parser: Lekvar = parser
-        self._name = name
-        for conv in parser.converters:
-            key = 'get' + conv
-            getter = functools.partial(self.get, _impl=getattr(parser, key))
-            setattr(self, key, getter)
-        self._option_references: _default_dict[str, str] = _default_dict()
-        self._inherit_bw: deque[LekvarSectionProxy] = deque()
-        self._inherit_fw: deque[LekvarSectionProxy] = deque()
-
-
-    def __repr__(self):
-        return '<Section: {}>'.format(self._name)
-
-    def __getitem__(self, key):
-        if not self._parser.has_option(self._name, key):
-            raise KeyError(key)
-        return self._parser.get(self._name, key)
-
-    def __setitem__(self, key, value):
-        self._parser._validate_value_types(option=key, value=value)
-        return self._parser.set(self._name, key, value)
-
-    def __delitem__(self, key):
-        if not (self._parser.has_option(self._name, key) and
-                self._parser.remove_option(self._name, key)):
-            raise KeyError(key)
-
-    def __contains__(self, key):
-        return self._parser.has_option(self._name, key)
-
-    def __len__(self):
-        return len(self._options())
-
-    def __iter__(self):
-        return self._options().__iter__()
-    
-    def _options(self):
-        if self._name != self._parser.default_section:
-            return self._parser.options(self._name)
-        else:
-            return self._parser.defaults()
-
-    @property
-    def parser(self):
-        # The parser object of the proxy is read-only.
-        return self._parser
-
-    @property
-    def name(self):
-        # The name of the section on a proxy is read-only.
-        return self._name
-
-    def get(self, option, fallback=None, *, raw=False, vars=None,
-            _impl=None, **kwargs):
-        """Get an option value.
-
-        Unless `fallback` is provided, `None` will be returned if the option
-        is not found.
-
-        """
-        # If `_impl` is provided, it should be a getter method on the parser
-        # object that provides the desired type conversion.
-        if not _impl:
-            _impl = self._parser.get
-        return _impl(self._name, option, raw=raw, vars=vars,
-                     fallback=fallback, **kwargs)
 
 class Lekvar(RawConfigParser):
     r"\[((?P<head>[^:]+)\.)?(?P<main>[^:.]+)(\s*:\s*(?P<inh>.*)\s*)?\]"
@@ -117,22 +53,43 @@ class Lekvar(RawConfigParser):
     BOOLEAN_STATES = {'1': True, 'yes': True, 'true': True, 'on': True,
                       '0': False, 'no': False, 'false': False, 'off': False}
     
-    def __init__(self): 
-        super().__init__()
-        self._proxy_tree: _default_dict[str, str] = _default_dict()
-        self._proxy_inheritance: _default_dict[str, deque] = _default_dict()
-        self._param_dict = _default_dict()
-        self._all_options = _default_dict()
+    def __init__(self, defaults=None, dict_type=_default_dict,
+                 allow_no_value=False, *, delimiters=('=', ':'),
+                 comment_prefixes=('#', ';'), inline_comment_prefixes=None,
+                 strict=True, empty_lines_in_values=True,
+                 default_section=DEFAULTSECT,
+                 interpolation=_UNSET, converters=_UNSET):
+        
+        super().__init__(
+            defaults, dict_type, allow_no_value, 
+            delimiters = delimiters,
+            comment_prefixes = comment_prefixes, 
+            inline_comment_prefixes = inline_comment_prefixes,
+            strict = strict, 
+            empty_lines_in_values = empty_lines_in_values,
+            default_section = default_section,
+            interpolation = interpolation, 
+            converters = converters)
+        # TODO: maybe should just initialize it myself
+        
+        self._all_options = self._dict()
+        self._defaults: ComposeMap = ComposeMap(self._dict(), self._all_options)
+        self._sections: dict[str, ComposeMap] = self._dict()
+
+        self._proxy_tree: dict[str, str] = self._dict()
+        self._proxy_inheritance: dict[str, deque] = self._dict()
+        
+        self._inherit_fw = self._dict()
 
     def __getitem__(self, __name: str) -> Any:
         if __name == self.default_section:
-            return self._defaults.copy()
+            return dict(self._defaults)
         if __name not in self._sections.keys(): 
             raise KeyError
         
         # TODO: this doesnt work with yet
         # TODO: probably has a lot of bugs
-        final = self._defaults.copy()
+        final = dict(self._defaults)
         for name in self._proxy_inheritance[__name]:
             current = name
             while current != self.default_section:
@@ -250,8 +207,8 @@ class Lekvar(RawConfigParser):
 
         if section in self._sections:
             raise DuplicateSectionError(section)
-        self._sections[section] = self._dict()
-        self._proxies[section] = LekvarSectionProxy(self, section)
+        self._sections[section] = ComposeMap(self._dict(), self._all_options)
+        self._proxies[section] = SectionProxy(self, section)
         
     def _read(self, fp: TextIO, fpname: str):
         elements_added = set()
