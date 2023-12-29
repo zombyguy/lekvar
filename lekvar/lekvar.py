@@ -106,18 +106,18 @@ class Lekvar(RawConfigParser):
 
     def _resolve_inheritance_dag(self):
         self._create_topological_order()
-
-        for section in self._top_order:
-            if section == self.default_section:
-                sect_dict = self._defaults
-            else: 
-                sect_dict = self._sections[section]
-            for option in self._options(section):
-                for out_nb in self._inherit_fw[section]:
-                    if option in self._options(out_nb):
+        # TODO: this doesn't care about inheritance order
+        for section in self._top_order[1:]:
+            for in_nb in self._inherit_bw[section]:
+                if in_nb == self.default_section:
+                    in_sec = self._defaults
+                else: 
+                    in_sec = self._sections[in_nb]
+                for option in self._options(in_nb):
+                    if option in self._options(section):
                         continue
-                    self._sections[out_nb].dict_1[option] = \
-                        sect_dict.dict_1[option]
+                    self._sections[section].dict_1[option] = \
+                        in_sec.dict_1[option]
 
 
     def add_section(self, section: str):
