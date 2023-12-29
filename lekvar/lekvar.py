@@ -18,15 +18,15 @@ from configparser import (
     _UNSET
 )
 from collections import ChainMap, defaultdict, deque
-from .composemap import ComposeMap
+from .composemap import ComposeMutMap
 import functools
+import itertools
 from typing import Any, TextIO
 import sys
 import re
 
 
 class Lekvar(RawConfigParser):
-    r"\[((?P<head>[^:]+)\.)?(?P<main>[^:.]+)(\s*:\s*(?P<inh>.*)\s*)?\]"
     _SECT_TMPL = r"""
         \[                          # ex.: [ q.w.e.asd : b,c,d]
         (?P<header>                 # header: ' q.w.e.asd '
@@ -36,7 +36,7 @@ class Lekvar(RawConfigParser):
         (:(?P<inherit>.*))?         # inherit: ' b,c,d'
         \]
         """
-    _OPT_TMPL = r"""                    # ex.: ' a > b = 123'
+    _OPT_TMPL = r"""                # ex.: ' a > b = 123'
         (?P<option>.*?)             # option: ' a'
         (\s*>\s*
         (?P<to_head>[^{delim}]+)    # to_head: 'b ' 
@@ -73,8 +73,8 @@ class Lekvar(RawConfigParser):
         # TODO: maybe should just initialize it myself
         
         self._all_options = self._dict()
-        self._defaults: ComposeMap = ComposeMap(self._dict(), self._all_options)
-        self._sections: dict[str, ComposeMap] = self._dict()
+        self._defaults: ComposeMutMap = ComposeMutMap(self._dict(), self._all_options)
+        self._sections: dict[str, ComposeMutMap] = self._dict()
 
         self._proxy_tree: dict[str, str] = self._dict()
         self._proxy_inheritance: dict[str, deque] = self._dict()
@@ -207,13 +207,14 @@ class Lekvar(RawConfigParser):
 
         if section in self._sections:
             raise DuplicateSectionError(section)
-        self._sections[section] = ComposeMap(self._dict(), self._all_options)
+        self._sections[section] = ComposeMutMap(self._dict(), self._all_options)
         self._proxies[section] = SectionProxy(self, section)
         
     def _read(self, fp: TextIO, fpname: str):
         elements_added = set()
-        cursect = None                        # None, or a dictionary
+        curproxy: SectionProxy | None = None                        # None, or a dictionary
         sectname = None
+        to_sect = None
         optname = None
         lineno = 0
         indent_level = 0
@@ -221,6 +222,7 @@ class Lekvar(RawConfigParser):
         for lineno, line in enumerate(fp, start=1):
             comment_start = sys.maxsize
             # strip inline comments
+            # TODO: interesting logic, might rewrite, regexify
             inline_prefixes = {p: -1 for p in self._inline_comment_prefixes}
             while comment_start == sys.maxsize and inline_prefixes:
                 next_prefixes = {}
@@ -245,10 +247,10 @@ class Lekvar(RawConfigParser):
                     # add empty line to the value, but only if there was no
                     # comment on the line
                     if (comment_start is None and
-                        cursect is not None and
+                        curproxy is not None and
                         optname and
-                        cursect[optname] is not None):
-                        cursect[optname].append('') # newlines added at join
+                        self._all_options[f"{to_sect}.{optname}"] is not None):
+                        self._all_options[f"{to_sect}.{optname}"].append('') # newlines added at join
                 else:
                     # empty line marks end of value
                     indent_level = sys.maxsize
@@ -256,46 +258,51 @@ class Lekvar(RawConfigParser):
             # continuation line?
             first_nonspace = self.NONSPACECRE.search(line)
             cur_indent_level = first_nonspace.start() if first_nonspace else 0
-            if (cursect is not None and optname and
+            if (curproxy is not None and optname and
                 cur_indent_level > indent_level):
-                cursect[optname].append(value)
+                self._all_options[f"{to_sect}.{optname}"].append(value)
             # a section header or option header?
             else:
                 indent_level = cur_indent_level
                 # is it a section header?
                 mo = self.SECTCRE.match(value)
                 if mo:
-                    sectname = mo.group('header')
-                    if sectname == self.default_section:
-                        cursect = self._defaults
+                    header, base, head, inherit = mo.group('header', 'base', 'head', 'inherit')
+                    header = header.strip()
+                    if header == self.default_section:
+                        curproxy = self._proxies[self.default_section]
+                        sectname = ''
                     else: 
+                        sectname = header
                         self.add_section(sectname)
-                        cursect = self._sections[sectname]
+                        curproxy = self._proxies[sectname]
                         elements_added.add(sectname)
                     # So sections can't start with a continuation line
                     optname = None
                 # no section header in the file?
-                elif cursect is None:
+                elif sectname is None:
                     raise MissingSectionHeaderError(fpname, lineno, line)
                 # an option line?
                 else:
                     mo = self._optcre.match(value)
                     if mo:
-                        optname, vi, optval = mo.group('option', 'vi', 'value')
+                        optname, to_head, vi, optval = mo.group('option', 'to_head', 'vi', 'value')
                         if not optname:
                             e = self._handle_error(e, fpname, lineno, line)
+                        if to_head is not None:
+                            to_sect = f"{sectname}.{to_head.strip()}"
+                            if to_sect not in self._sections:
+                                self.add_section(to_sect)
+                        else: 
+                            to_sect = sectname
                         optname = self.optionxform(optname.rstrip())
                         if (self._strict and
-                            (sectname, optname) in elements_added):
-                            raise DuplicateOptionError(sectname, optname,
+                            (to_sect, optname) in elements_added):
+                            raise DuplicateOptionError(to_sect, optname,
                                                        fpname, lineno)
-                        elements_added.add((sectname, optname))
-                        if optval is not None:
-                            optval = optval.strip()
-                            cursect[optname] = [optval]
-                            # TODO: value type parsing
-                        else:
-                            cursect[optname] = None
+                        elements_added.add((to_sect, optname))
+                        self.set(to_sect, optname, optval, True)
+                        # TODO: value type parsing
                     else:
                         # a non-fatal parsing error occurred. set up the
                         # exception but keep going. the exception will be
@@ -306,3 +313,33 @@ class Lekvar(RawConfigParser):
         # if any parsing errors occurred, raise an exception
         if e:
             raise e
+
+
+    def _join_multiline_values(self):
+        for name, val in self._all_options.items():
+            if isinstance(val, list):
+                val = '\n'.join(val).rstrip()
+                self._all_options[name] = val
+            # TODO: interpolation
+            # self._all_options[name] = self._interpolation.before_read(self, section, name, val)
+
+    def set(self, section, option, value=None, in_read = False):
+        # TODO: interpolation
+                
+        if not section or section == self.default_section:
+            sectdict = self._defaults
+            section = ''
+        else:
+            try:
+                sectdict = self._sections[section]
+            except KeyError:
+                raise NoSectionError(section) from None
+        
+        rel_opt = self.optionxform(option.strip())
+        abs_opt = f"{section}.{rel_opt}"
+
+        sectdict.dict_1[rel_opt] = abs_opt
+        if value == None:
+            sectdict.dict_2[abs_opt] = None
+        else:
+            sectdict.dict_2[abs_opt] = value if not in_read else [value]
