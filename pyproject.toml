@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lekvar"
+version = "0.0.1"
+authors = [
+  { name="Zsombor Sándor" },
+]
+description="Extended config parser with inheritance"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Libraries",
+    "License :: OSI Approved :: MIT License",
+    'Operating System :: OS Independent',
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3 :: Only",
+]
+keywords = [
+    "lekvar", 
+    "config", 
+    "parse", 
+    "configparser", 
+    "inherit",
+]
+
+[project.urls]
+Homepage = "https://github.com/zombyguy/lekvar/"
+Repository = "https://github.com/zombyguy/lekvar/"
+Issues = "https://github.com/zombyguy/lekvar/issues"
