@@ -3,12 +3,13 @@ from configparser import DuplicateSectionError, DuplicateOptionError, MissingSec
 from collections import ChainMap, defaultdict, deque
 from collections.abc import MutableMapping
 import functools
-from typing import Any
+from typing import Any, TextIO
 import sys
+import re
 
 class LekvarParameter:
     def __init__(self, name, value):
-        self._name = name
+        self._name: str = name
         self._value = value
         self._locations = deque()
 
@@ -20,12 +21,16 @@ class LekvarParameter:
 
 class LekvarSectionProxy(MutableMapping):
     def __init__(self, parser, name):
-        self._parser = parser
+        self._parser: Lekvar = parser
         self._name = name
         for conv in parser.converters:
             key = 'get' + conv
             getter = functools.partial(self.get, _impl=getattr(parser, key))
             setattr(self, key, getter)
+        self._option_references: _default_dict[str, str] = _default_dict()
+        self._inherit_bw: deque[LekvarSectionProxy] = deque()
+        self._inherit_fw: deque[LekvarSectionProxy] = deque()
+
 
     def __repr__(self):
         return '<Section: {}>'.format(self._name)
@@ -85,13 +90,39 @@ class LekvarSectionProxy(MutableMapping):
                      fallback=fallback, **kwargs)
 
 class Lekvar(RawConfigParser):
+    r"\[((?P<head>[^:]+)\.)?(?P<main>[^:.]+)(\s*:\s*(?P<inh>.*)\s*)?\]"
+    _SECT_TMPL = r"""
+        \[                          # ex.: [ q.w.e.asd : b,c,d]
+        (?P<header>                 # header: ' q.w.e.asd '
+        ((?P<base>[^:]+)\.)?        # base: ' q.w.e'
+        (?P<head>[^:\.]+)           # head: 'asd '
+        )
+        (:(?P<inherit>.*))?         # inherit: ' b,c,d'
+        \]
+        """
+    _OPT_TMPL = r"""                    # ex.: ' a > b = 123'
+        (?P<option>.*?)             # option: ' a'
+        (\s*>\s*
+        (?P<to_head>[^{delim}]+)    # to_head: 'b ' 
+        )?
+        \s*(?P<vi>{delim})\s*       # vi: '=' 
+        (?P<value>.*)$              # value: '123'
+        """
+    # _OPT_NV_TMPL = r""" # TODO
+
+    SECTCRE = re.compile(_SECT_TMPL, re.VERBOSE)
+    OPTCRE = re.compile(_OPT_TMPL.format(delim="=|:"), re.VERBOSE)
+    # OPTCRE_NV = re.compile(_OPT_NV_TMPL.format(delim="=|:"), re.VERBOSE)
+    NONSPACECRE = re.compile(r"\S")
+    BOOLEAN_STATES = {'1': True, 'yes': True, 'true': True, 'on': True,
+                      '0': False, 'no': False, 'false': False, 'off': False}
     
     def __init__(self): 
         super().__init__()
         self._proxy_tree: _default_dict[str, str] = _default_dict()
-        self._proxy_inheritance = _default_dict()
+        self._proxy_inheritance: _default_dict[str, deque] = _default_dict()
         self._param_dict = _default_dict()
-        self._options = _default_dict()
+        self._all_options = _default_dict()
 
     def __getitem__(self, __name: str) -> Any:
         if __name == self.default_section:
@@ -135,24 +166,7 @@ class Lekvar(RawConfigParser):
             
             section_dict = self._sections[section_name]
             self._sections[section_name] = {**new_section_dict, **section_dict}
-            
 
-    def _build_tree(self):
-        self._proxy_tree = {self.default_section: None}
-        for name in self._proxies.keys():
-            self._assign_parent_proxy(name)
-
-    def _assign_parent_proxy(self, name):
-        if name in self._proxy_tree.keys(): return
-
-        i = name.rfind(".")
-        if i == -1: self._proxy_tree[name] = self.default_section; return
-        
-        parent = name[:i]
-        self._proxy_tree[name] = parent
-        if parent not in self._proxies.keys():
-            self.add_section(parent)
-            self._assign_parent_proxy(parent)
     
     def _unify_values(self, section, vars):
         map_order = []
@@ -231,11 +245,6 @@ class Lekvar(RawConfigParser):
             return option in self.options(section)
         
     def add_section(self, section):
-        """Create a new section in the configuration.
-
-        Raise DuplicateSectionError if a section by the specified name
-        already exists. Raise ValueError if name is DEFAULT.
-        """
         if section == self.default_section:
             raise ValueError('Invalid section name: %r' % section)
 
@@ -244,14 +253,14 @@ class Lekvar(RawConfigParser):
         self._sections[section] = self._dict()
         self._proxies[section] = LekvarSectionProxy(self, section)
         
-    def _read(self, fp, fpname):
+    def _read(self, fp: TextIO, fpname: str):
         elements_added = set()
         cursect = None                        # None, or a dictionary
         sectname = None
         optname = None
         lineno = 0
         indent_level = 0
-        e = None                              # None, or an exception
+        e: Exception | None = None
         for lineno, line in enumerate(fp, start=1):
             comment_start = sys.maxsize
             # strip inline comments
@@ -300,18 +309,11 @@ class Lekvar(RawConfigParser):
                 mo = self.SECTCRE.match(value)
                 if mo:
                     sectname = mo.group('header')
-                    if sectname in self._sections:
-                        if self._strict and sectname in elements_added:
-                            raise DuplicateSectionError(sectname, fpname,
-                                                        lineno)
-                        cursect = self._sections[sectname]
-                        elements_added.add(sectname)
-                    elif sectname == self.default_section:
+                    if sectname == self.default_section:
                         cursect = self._defaults
-                    else:
-                        cursect = self._dict()
-                        self._sections[sectname] = cursect
-                        self._proxies[sectname] = LekvarSectionProxy(self, sectname)
+                    else: 
+                        self.add_section(sectname)
+                        cursect = self._sections[sectname]
                         elements_added.add(sectname)
                     # So sections can't start with a continuation line
                     optname = None
@@ -331,13 +333,11 @@ class Lekvar(RawConfigParser):
                             raise DuplicateOptionError(sectname, optname,
                                                        fpname, lineno)
                         elements_added.add((sectname, optname))
-                        # This check is fine because the OPTCRE cannot
-                        # match if it would set optval to None
                         if optval is not None:
                             optval = optval.strip()
                             cursect[optname] = [optval]
+                            # TODO: value type parsing
                         else:
-                            # valueless option handling
                             cursect[optname] = None
                     else:
                         # a non-fatal parsing error occurred. set up the
