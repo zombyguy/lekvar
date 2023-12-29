@@ -19,9 +19,8 @@ from configparser import (
     _UNSET
 )
 from collections import ChainMap, defaultdict, deque
+from collections.abc import ItemsView
 from .composemap import ComposeMutMap
-import functools
-import itertools
 from typing import Any, TextIO
 import sys
 import re
@@ -82,84 +81,77 @@ class Lekvar(RawConfigParser):
         self._proxy_tree: dict[str, str] = self._dict()
         self._proxy_inheritance: dict[str, deque] = self._dict()
         
-        self._inherit_fw = self._dict()
-    
-    def _resolve_inline_inheritance(self):
-        to_be_created = defaultdict(dict)
+        self._inherit_fw: dict[str, deque[str]] = defaultdict(deque)
+        self._inherit_bw: dict[str, deque[str]] = defaultdict(deque)
+        self._top_order: list[str]
 
-        for section_name, section_dict in self._sections.items():
-            to_be_deleted = list()
-            for temp, val in section_dict.items():
-                if ">" not in temp: continue
 
-                key, subsec_name = temp.split(">")
-                key = key.strip()
-                subsec_name = subsec_name.strip()
+    def _create_topological_order(self):
+        source_que = deque()
+        source_que.append("DEFAULT")
+        in_degrees = {sect: len(inh) for sect, inh in self._inherit_bw.items()}
+        top_order = list()
 
-                sec = f"{section_name}.{subsec_name}"
-                to_be_created[sec][key] = val
-                to_be_deleted.append(temp)
+        while len(source_que) > 0:
+            source = source_que.popleft()
+            top_order.append(source)
             
-            for key in to_be_deleted:
-                del self._sections[section_name][key]
+            for out_nb in self._inherit_fw[source]:
+                in_degrees[out_nb] -= 1
+                if in_degrees[out_nb] == 0: 
+                    source_que.append(out_nb)
         
-        for section_name, new_section_dict in to_be_created.items():
-            if section_name not in self._sections.keys():
-                self.add_section(section_name)
-            
-            section_dict = self._sections[section_name]
-            self._sections[section_name] = {**new_section_dict, **section_dict}
-    
-    def _resolve_section_names(self):
-        to_be_deleted = []
-        new_sections = dict()
-        new_proxies = dict()
-        new_inh = set()
+        self._top_order = top_order
 
-        # TODO: update while iterating through it
-        for temp in self._sections.keys():
-            if ":" not in temp: 
-                self._proxy_inheritance[temp] = [temp]
-                continue
-                
-            section, inheritance = temp.split(":")
-            section = section.strip()
-            inheritance = [sec.strip() for sec in inheritance.split(",")]
-            new_inh.update(inheritance)
+    def _resolve_inheritance_dag(self):
+        self._create_topological_order()
+        # TODO: this doesn't care about inheritance order
+        for section in self._top_order[1:]:
+            for in_nb in self._inherit_bw[section]:
+                if in_nb == self.default_section:
+                    in_sec = self._defaults
+                else: 
+                    in_sec = self._sections[in_nb]
+                for option in self._options(in_nb):
+                    if option in self._options(section):
+                        continue
+                    self._sections[section].dict_1[option] = \
+                        in_sec.dict_1[option]
 
-            self._proxy_inheritance[section] = [section] + inheritance
 
-            new_sections[section] = self._sections[temp]
-            new_proxies[section] = self._proxies[temp]
-            new_proxies[section]._name = section
-            to_be_deleted.append(temp)
-
-        for sec in to_be_deleted:
-            del self._sections[sec]
-            del self._proxies[sec]
-
-        self._sections.update(new_sections)
-        self._proxies.update(new_proxies)
-        print(new_inh)
-        for sec in new_inh:
-            if sec in self._sections.keys(): continue
-            self.add_section(sec)
-
-    def add_section(self, section):
+    def add_section(self, section: str):
         if section == self.default_section:
             raise ValueError('Invalid section name: %r' % section)
 
         if section in self._sections:
             raise DuplicateSectionError(section)
+
         self._sections[section] = ComposeMutMap(self._dict(), self._all_options)
         self._proxies[section] = SectionProxy(self, section)
 
+        self._inherit_fw[section] # initializes it
+        if (i := section.rfind(".")) == -1:
+            self._inherit_bw[section].appendleft(self.default_section)
+            self._inherit_fw[self.default_section].append(section)
+        else:
+            head = section[:i]
+            if head not in self._sections:
+                self.add_section(head)
+            self._inherit_bw[section].appendleft(head)
+            self._inherit_fw[head].append(section)
+
     def options(self, section):
+        return list(self._options(section))
+
+    def _options(self, section):
+        if section == self.default_section:
+            return self._defaults.keys()
+
         try:
             opts = self._sections[section]
         except KeyError:
             raise NoSectionError(section) from None
-        return list(opts.keys())
+        return opts.keys()
 
     def get(self, section, option, *, raw=False, vars=None, fallback=_UNSET):
         if section == self.default_section:
@@ -187,11 +179,31 @@ class Lekvar(RawConfigParser):
             # TODO: Interpolation
             return value
 
-    def items(self, section=_UNSET, raw=False, vars=None):
+    def items(self, section:str =_UNSET, raw=False, vars=None) -> list | ItemsView:
         if section is _UNSET: 
             return super().items()
-        # TODO: everything else
-        #return super().items(section, raw, vars)
+        
+        try:
+            d = dict(self._sections[section])
+        except KeyError:
+            if section != self.default_section:
+                raise NoSectionError(section)
+            else:
+                d = dict(self._defaults)
+        
+        if vars:
+            for key, value in vars.items():
+                k = self.optionxform(key)
+                if k in d:
+                    d[self.optionxform(key)] = value
+
+        #TODO: interpolation
+        if raw:
+            value_getter = lambda option: d[option]
+        else: 
+            value_getter = lambda option: self._interpolation.before_get(self,
+                section, option, d[option], d)
+        return [(option, value_getter(option)) for option in d.keys()]
 
     def popitem(self):
         # TODO: only the leafs should be able to pop
@@ -246,7 +258,7 @@ class Lekvar(RawConfigParser):
 
     def _read(self, fp: TextIO, fpname: str):
         elements_added = set()
-        curproxy: SectionProxy | None = None                        # None, or a dictionary
+        curproxy: SectionProxy | None = None
         sectname = None
         to_sect = None
         optname = None
@@ -313,6 +325,13 @@ class Lekvar(RawConfigParser):
                         self.add_section(sectname)
                         curproxy = self._proxies[sectname]
                         elements_added.add(sectname)
+
+                        if inherit is not None:
+                            inherit_from = [i.strip() for i in inherit.split(",")]
+                            for inh in inherit_from:
+                                self._inherit_bw[header].append(inh)
+                                self._inherit_fw[inh].append(header)
+
                     # So sections can't start with a continuation line
                     optname = None
                 # no section header in the file?
