@@ -19,9 +19,8 @@ from configparser import (
     _UNSET
 )
 from collections import ChainMap, defaultdict, deque
+from collections.abc import ItemsView
 from .composemap import ComposeMutMap
-import functools
-import itertools
 from typing import Any, TextIO
 import sys
 import re
@@ -180,11 +179,31 @@ class Lekvar(RawConfigParser):
             # TODO: Interpolation
             return value
 
-    def items(self, section=_UNSET, raw=False, vars=None):
+    def items(self, section:str =_UNSET, raw=False, vars=None) -> list | ItemsView:
         if section is _UNSET: 
             return super().items()
-        # TODO: everything else
-        #return super().items(section, raw, vars)
+        
+        try:
+            d = dict(self._sections[section])
+        except KeyError:
+            if section != self.default_section:
+                raise NoSectionError(section)
+            else:
+                d = dict(self._defaults)
+        
+        if vars:
+            for key, value in vars.items():
+                k = self.optionxform(key)
+                if k in d:
+                    d[self.optionxform(key)] = value
+
+        #TODO: interpolation
+        if raw:
+            value_getter = lambda option: d[option]
+        else: 
+            value_getter = lambda option: self._interpolation.before_get(self,
+                section, option, d[option], d)
+        return [(option, value_getter(option)) for option in d.keys()]
 
     def popitem(self):
         # TODO: only the leafs should be able to pop
@@ -239,7 +258,7 @@ class Lekvar(RawConfigParser):
 
     def _read(self, fp: TextIO, fpname: str):
         elements_added = set()
-        curproxy: SectionProxy | None = None                        # None, or a dictionary
+        curproxy: SectionProxy | None = None
         sectname = None
         to_sect = None
         optname = None
