@@ -82,7 +82,8 @@ class Lekvar(RawConfigParser):
         self._proxy_tree: dict[str, str] = self._dict()
         self._proxy_inheritance: dict[str, deque] = self._dict()
         
-        self._inherit_fw = self._dict()
+        self._inherit_fw: dict[str, deque[str]] = defaultdict(deque)
+        self._inherit_bw: dict[str, deque[str]] = defaultdict(deque)
     
     def _resolve_inline_inheritance(self):
         to_be_created = defaultdict(dict)
@@ -145,14 +146,25 @@ class Lekvar(RawConfigParser):
             if sec in self._sections.keys(): continue
             self.add_section(sec)
 
-    def add_section(self, section):
+    def add_section(self, section: str):
         if section == self.default_section:
             raise ValueError('Invalid section name: %r' % section)
 
         if section in self._sections:
             raise DuplicateSectionError(section)
+
         self._sections[section] = ComposeMutMap(self._dict(), self._all_options)
         self._proxies[section] = SectionProxy(self, section)
+
+        if (i := section.rfind(".")) == -1:
+            self._inherit_bw[section].append(self.default_section)
+            self._inherit_fw[self.default_section].append(section)
+        else:
+            head = section[:i]
+            if head not in self._sections:
+                self.add_section(head)
+            self._inherit_bw[section].append(head)
+            self._inherit_fw[head].append(section)
 
     def options(self, section):
         try:
@@ -313,6 +325,13 @@ class Lekvar(RawConfigParser):
                         self.add_section(sectname)
                         curproxy = self._proxies[sectname]
                         elements_added.add(sectname)
+
+                        if inherit is not None:
+                            inherit_from = [i.strip() for i in inherit.split(",")]
+                            for inh in inherit_from:
+                                self._inherit_bw[header].append(inh)
+                                self._inherit_fw[inh].append(header)
+
                     # So sections can't start with a continuation line
                     optname = None
                 # no section header in the file?
