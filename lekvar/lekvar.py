@@ -2,6 +2,7 @@ from configparser import (
     RawConfigParser,
     SectionProxy,
 
+    Error,
     ParsingError,
     NoOptionError,
     NoSectionError,
@@ -24,7 +25,9 @@ import itertools
 from typing import Any, TextIO
 import sys
 import re
+import warnings
 
+class SectionInheritanceError(Error): ...
 
 class Lekvar(RawConfigParser):
     _SECT_TMPL = r"""
@@ -80,23 +83,6 @@ class Lekvar(RawConfigParser):
         self._proxy_inheritance: dict[str, deque] = self._dict()
         
         self._inherit_fw = self._dict()
-
-    def __getitem__(self, __name: str) -> Any:
-        if __name == self.default_section:
-            return dict(self._defaults)
-        if __name not in self._sections.keys(): 
-            raise KeyError
-        
-        # TODO: this doesnt work with yet
-        # TODO: probably has a lot of bugs
-        final = dict(self._defaults)
-        for name in self._proxy_inheritance[__name]:
-            current = name
-            while current != self.default_section:
-                #print("Getting tags for ", ".".join(tags[:i+1]))
-                final = {**self._sections[current], **final}
-                current = self._proxy_tree[current]
-        return final
     
     def _resolve_inline_inheritance(self):
         to_be_created = defaultdict(dict)
@@ -123,25 +109,6 @@ class Lekvar(RawConfigParser):
             
             section_dict = self._sections[section_name]
             self._sections[section_name] = {**new_section_dict, **section_dict}
-
-    
-    def _unify_values(self, section, vars):
-        map_order = []
-        current = section
-        try: 
-            while current != self.default_section:
-                map_order.append(self._sections[current])
-                current = self._proxy_tree[current]
-        except KeyError:
-            if section != self.default_section:
-                raise NoSectionError(section) from None
-        vardict = {}
-        if vars:
-            for key, value in vars.items():
-                if value is not None:
-                    value = str(value)
-                vardict[self.optionxform(key)] = value
-        return ChainMap(vardict, *map_order, self._defaults)
     
     def _resolve_section_names(self):
         to_be_deleted = []
@@ -178,29 +145,6 @@ class Lekvar(RawConfigParser):
             if sec in self._sections.keys(): continue
             self.add_section(sec)
 
-
-    def options(self, section):
-        opts = dict()
-        current = section
-        try:
-            while current != self.default_section:
-                opts = {**self._sections[current], **opts}
-                current = self._proxy_tree[current]
-        except KeyError:
-            raise NoSectionError(section) from None
-        opts = {**self._defaults, **opts}
-        return list(opts.keys())
-    
-    def has_option(self, section: str, option: str) -> bool:
-        if not section or section == self.default_section:
-            option = self.optionxform(option)
-            return option in self._defaults
-        elif section not in self._sections:
-            return False
-        else:
-            option = self.optionxform(option)
-            return option in self.options(section)
-        
     def add_section(self, section):
         if section == self.default_section:
             raise ValueError('Invalid section name: %r' % section)
@@ -209,7 +153,97 @@ class Lekvar(RawConfigParser):
             raise DuplicateSectionError(section)
         self._sections[section] = ComposeMutMap(self._dict(), self._all_options)
         self._proxies[section] = SectionProxy(self, section)
+
+    def options(self, section):
+        try:
+            opts = self._sections[section]
+        except KeyError:
+            raise NoSectionError(section) from None
+        return list(opts.keys())
+
+    def get(self, section, option, *, raw=False, vars=None, fallback=_UNSET):
+        if section == self.default_section:
+            section_dict = self._defaults
+        else: 
+            try:
+                section_dict = self._sections[section]
+            except KeyError:
+                if fallback is _UNSET:
+                    raise NoSectionError(section)
+                else:
+                    return fallback
         
+        try: 
+            value = section_dict[option]
+        except KeyError:
+            if fallback is _UNSET:
+                raise NoOptionError(option, section)
+            else: 
+                return fallback
+        
+        if raw or value is None:
+            return value
+        else: 
+            # TODO: Interpolation
+            return value
+
+    def items(self, section=_UNSET, raw=False, vars=None):
+        if section is _UNSET: 
+            return super().items()
+        # TODO: everything else
+        #return super().items(section, raw, vars)
+
+    def popitem(self):
+        # TODO: only the leafs should be able to pop
+        return super().popitem()
+    
+    def set(self, section, option, value=None, in_read = False):
+        # TODO: interpolation
+                
+        if not section or section == self.default_section:
+            sectdict = self._defaults
+            section = ''
+        else:
+            try:
+                sectdict = self._sections[section]
+            except KeyError:
+                raise NoSectionError(section) from None
+        
+        rel_opt = self.optionxform(option.strip())
+        abs_opt = f"{section}.{rel_opt}"
+
+        sectdict.dict_1[rel_opt] = abs_opt
+        if value == None:
+            sectdict.dict_2[abs_opt] = None
+        else:
+            sectdict.dict_2[abs_opt] = value if not in_read else [value]
+        
+    def write(self, fp, space_around_delimiters=True):
+        # TODO: writing is tricky
+        raise NotImplementedError
+        return super().write(fp, space_around_delimiters)
+    
+    def remove_option(self, section, option):
+        # TODO: DAG
+        raise NotImplementedError
+        return super().remove_option(section, option)
+
+    def remove_section(self, section):
+        # TODO: DAG
+        raise NotImplementedError
+        return super().remove_section(section)
+    
+    def __setitem__(self, key, value):
+        raise NotImplementedError
+    
+    def __delitem__(self, key):
+        raise NotImplementedError
+
+    def __len__(self):
+        # TODO: what is the logical length, when we account for inheritance?
+        return super().__len__()
+
+
     def _read(self, fp: TextIO, fpname: str):
         elements_added = set()
         curproxy: SectionProxy | None = None                        # None, or a dictionary
@@ -272,6 +306,8 @@ class Lekvar(RawConfigParser):
                     if header == self.default_section:
                         curproxy = self._proxies[self.default_section]
                         sectname = ''
+                        if inherit != None: 
+                            raise SectionInheritanceError("Default section cannot inherit.")
                     else: 
                         sectname = header
                         self.add_section(sectname)
@@ -323,23 +359,6 @@ class Lekvar(RawConfigParser):
             # TODO: interpolation
             # self._all_options[name] = self._interpolation.before_read(self, section, name, val)
 
-    def set(self, section, option, value=None, in_read = False):
-        # TODO: interpolation
-                
-        if not section or section == self.default_section:
-            sectdict = self._defaults
-            section = ''
-        else:
-            try:
-                sectdict = self._sections[section]
-            except KeyError:
-                raise NoSectionError(section) from None
-        
-        rel_opt = self.optionxform(option.strip())
-        abs_opt = f"{section}.{rel_opt}"
-
-        sectdict.dict_1[rel_opt] = abs_opt
-        if value == None:
-            sectdict.dict_2[abs_opt] = None
-        else:
-            sectdict.dict_2[abs_opt] = value if not in_read else [value]
+    def _unify_values(self, section, vars):
+        warnings.warn("Under normal operaion of 'Lekvar', this is never called.")
+        return super()._unify_values(section, vars)
