@@ -48,8 +48,35 @@ class Lekvar(RawConfigParser):
         """
     # _OPT_NV_TMPL = r""" # TODO
 
+    _INCL_TMPL = r"""
+        INCLUDE\s+
+        (?P<option>(?P<base>.*\.)(?P<head>[^.\s]+))
+        (\s+AS\s+(?P<rename>.*))?
+        """
+
+    _REN_TMPL = r"""
+        RENAME\s+
+        (?P<option>.*)
+        \s+TO\s+
+        (?P<rename>.*)
+        """
+
+    _AVD_TMPL = r"""
+        AVOID\s+
+        (?P<option>.*)
+        """
+    
+    _ONLY_TMPL = r"""
+        ONLY\s+
+        (?P<options>.*)
+        """
+
     SECTCRE = re.compile(_SECT_TMPL, re.VERBOSE)
-    OPTCRE = re.compile(_OPT_TMPL.format(delim="=|:"), re.VERBOSE)
+    OPTCRE  = re.compile(_OPT_TMPL.format(delim="=|:"), re.VERBOSE)
+    INCLCRE = re.compile(_INCL_TMPL, re.VERBOSE)
+    RENCRE  = re.compile(_REN_TMPL , re.VERBOSE)
+    AVDCRE  = re.compile(_AVD_TMPL , re.VERBOSE)
+    ONLYCRE = re.compile(_ONLY_TMPL, re.VERBOSE)
     # OPTCRE_NV = re.compile(_OPT_NV_TMPL.format(delim="=|:"), re.VERBOSE)
     NONSPACECRE = re.compile(r"\S")
     BOOLEAN_STATES = {'1': True, 'yes': True, 'true': True, 'on': True,
@@ -77,14 +104,14 @@ class Lekvar(RawConfigParser):
         self._all_options = self._dict()
         self._defaults: ComposeMutMap = ComposeMutMap(self._dict(), self._all_options)
         self._sections: dict[str, ComposeMutMap] = self._dict()
-
-        self._proxy_tree: dict[str, str] = self._dict()
-        self._proxy_inheritance: dict[str, deque] = self._dict()
         
         self._inherit_fw: dict[str, deque[str]] = defaultdict(deque)
         self._inherit_bw: dict[str, deque[str]] = defaultdict(deque)
         self._top_order: list[str]
 
+        self._renames: dict[str, dict[str,str]] = defaultdict(lambda: defaultdict(str))
+        self._avoids: dict[str, deque[str]] = defaultdict(deque)
+        self._only: dict[str, set[str]] = defaultdict(set)
 
     def _create_topological_order(self):
         source_que = deque()
@@ -105,7 +132,7 @@ class Lekvar(RawConfigParser):
 
     def _resolve_inheritance_dag(self):
         self._create_topological_order()
-        # TODO: this doesn't care about inheritance order
+        
         for section in self._top_order[1:]:
             for in_nb in self._inherit_bw[section]:
                 if in_nb == self.default_section:
@@ -117,6 +144,19 @@ class Lekvar(RawConfigParser):
                         continue
                     self._sections[section].dict_1[option] = \
                         in_sec.dict_1[option]
+            
+            for opt, new_opt in self._renames[section].items():
+                self._sections[section].dict_1[new_opt] = self._sections[section].dict_1[opt]
+                del self._sections[section].dict_1[opt]
+
+            for opt in self._avoids[section]:
+                self._sections[section].dict_1.pop(opt, None)
+
+            if section in self._only:
+                sect_dict = self._sections[section].dict_1
+                for opt in list(sect_dict.keys()):
+                    if opt not in self._only[section]:
+                        del sect_dict[opt]
 
 
     def add_section(self, section: str):
@@ -311,8 +351,7 @@ class Lekvar(RawConfigParser):
             else:
                 indent_level = cur_indent_level
                 # is it a section header?
-                mo = self.SECTCRE.match(value)
-                if mo:
+                if mo := self.SECTCRE.match(value):
                     header, base, head, inherit = mo.group('header', 'base', 'head', 'inherit')
                     header = header.strip()
                     if header == self.default_section:
@@ -338,32 +377,47 @@ class Lekvar(RawConfigParser):
                 elif sectname is None:
                     raise MissingSectionHeaderError(fpname, lineno, line)
                 # an option line?
-                else:
-                    mo = self._optcre.match(value)
-                    if mo:
-                        optname, to_head, vi, optval = mo.group('option', 'to_head', 'vi', 'value')
-                        if not optname:
-                            e = self._handle_error(e, fpname, lineno, line)
-                        if to_head is not None:
-                            to_sect = f"{sectname}.{to_head.strip()}"
-                            if to_sect not in self._sections:
-                                self.add_section(to_sect)
-                        else: 
-                            to_sect = sectname
-                        optname = self.optionxform(optname.rstrip())
-                        if (self._strict and
-                            (to_sect, optname) in elements_added):
-                            raise DuplicateOptionError(to_sect, optname,
-                                                       fpname, lineno)
-                        elements_added.add((to_sect, optname))
-                        self.set(to_sect, optname, optval, True)
-                        # TODO: value type parsing
-                    else:
-                        # a non-fatal parsing error occurred. set up the
-                        # exception but keep going. the exception will be
-                        # raised at the end of the file and will contain a
-                        # list of all bogus lines
+                elif mo := self._optcre.match(value):
+                    optname, to_head, vi, optval = mo.group('option', 'to_head', 'vi', 'value')
+                    if not optname:
                         e = self._handle_error(e, fpname, lineno, line)
+                    if to_head is not None:
+                        to_sect = f"{sectname}.{to_head.strip()}"
+                        if to_sect not in self._sections:
+                            self.add_section(to_sect)
+                    else: 
+                        to_sect = sectname
+                    optname = self.optionxform(optname.rstrip())
+                    if (self._strict and
+                        (to_sect, optname) in elements_added):
+                        raise DuplicateOptionError(to_sect, optname,
+                                                    fpname, lineno)
+                    elements_added.add((to_sect, optname))
+                    self.set(to_sect, optname, optval, True)
+                    # TODO: value type parsing
+
+                elif mo := self.INCLCRE.match(value):
+                    if not (opt_name := mo.group("rename")):
+                        opt_name = mo.group("head")
+                        
+                    self._sections[sectname].dict_1[opt_name] = mo.group("option")
+
+                elif mo := self.RENCRE.match(value):
+                    self._renames[sectname][mo.group("option")] = mo.group("rename")
+                
+                elif mo := self.AVDCRE.match(value):
+                    self._avoids[sectname].append(mo.group("option"))
+
+                elif mo := self.ONLYCRE.match(value):
+                    for opt in mo.group("options").split(","):
+                        opt = opt.strip()
+                        self._only[sectname].add(opt)
+                else:
+                    # a non-fatal parsing error occurred. set up the
+                    # exception but keep going. the exception will be
+                    # raised at the end of the file and will contain a
+                    # list of all bogus lines
+                    e = self._handle_error(e, fpname, lineno, line)
         self._join_multiline_values()
         # if any parsing errors occurred, raise an exception
         if e:
