@@ -66,12 +66,17 @@ class Lekvar(RawConfigParser):
         (?P<option>.*)
         """
     
+    _ONLY_TMPL = r"""
+        ONLY\s+
+        (?P<options>.*)
+        """
 
     SECTCRE = re.compile(_SECT_TMPL, re.VERBOSE)
     OPTCRE  = re.compile(_OPT_TMPL.format(delim="=|:"), re.VERBOSE)
     INCLCRE = re.compile(_INCL_TMPL, re.VERBOSE)
     RENCRE  = re.compile(_REN_TMPL , re.VERBOSE)
     AVDCRE  = re.compile(_AVD_TMPL , re.VERBOSE)
+    ONLYCRE = re.compile(_ONLY_TMPL, re.VERBOSE)
     # OPTCRE_NV = re.compile(_OPT_NV_TMPL.format(delim="=|:"), re.VERBOSE)
     NONSPACECRE = re.compile(r"\S")
     BOOLEAN_STATES = {'1': True, 'yes': True, 'true': True, 'on': True,
@@ -106,6 +111,7 @@ class Lekvar(RawConfigParser):
 
         self._renames: dict[str, dict[str,str]] = defaultdict(lambda: defaultdict(str))
         self._avoids: dict[str, deque[str]] = defaultdict(deque)
+        self._only: dict[str, set[str]] = defaultdict(set)
 
     def _create_topological_order(self):
         source_que = deque()
@@ -145,6 +151,12 @@ class Lekvar(RawConfigParser):
 
             for opt in self._avoids[section]:
                 self._sections[section].dict_1.pop(opt, None)
+
+            if section in self._only:
+                sect_dict = self._sections[section].dict_1
+                for opt in list(sect_dict.keys()):
+                    if opt not in self._only[section]:
+                        del sect_dict[opt]
 
 
     def add_section(self, section: str):
@@ -396,6 +408,10 @@ class Lekvar(RawConfigParser):
                 elif mo := self.AVDCRE.match(value):
                     self._avoids[sectname].append(mo.group("option"))
 
+                elif mo := self.ONLYCRE.match(value):
+                    for opt in mo.group("options").split(","):
+                        opt = opt.strip()
+                        self._only[sectname].add(opt)
                 else:
                     # a non-fatal parsing error occurred. set up the
                     # exception but keep going. the exception will be
