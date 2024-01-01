@@ -26,7 +26,13 @@ import sys
 import re
 import warnings
 
-class SectionInheritanceError(Error): ...
+class InheritanceResolutionError(Error):
+    """Raised when the inheritance DAG cannot resolve an option."""
+    
+    def __init__(self, msg=''):
+        # TODO
+        super().__init__()
+        
 
 class Lekvar(RawConfigParser):
     _SECT_TMPL = r"""
@@ -361,7 +367,7 @@ class Lekvar(RawConfigParser):
                         curproxy = self._proxies[self.default_section]
                         sectname = ''
                         if inherit != None: 
-                            raise SectionInheritanceError("Default section cannot inherit.")
+                            raise Error("Default section cannot inherit.")
                     else: 
                         sectname = header
                         self.add_section(sectname)
@@ -392,6 +398,9 @@ class Lekvar(RawConfigParser):
                     if not optname:
                         e = self._handle_error(e, fpname, lineno, line)
                     if to_head is not None:
+                        if to_head.isspace():
+                            e = self._handle_error(e, fpname, lineno, line)
+                            continue
                         to_sect = f"{sectname}.{to_head.strip()}"
                         if to_sect not in self._sections:
                             self.add_section(to_sect)
