@@ -31,10 +31,10 @@ class SectionInheritanceError(Error): ...
 class Lekvar(RawConfigParser):
     _SECT_TMPL = r"""
         \[                          # ex.: [ q.w.e.asd : b,c,d]
-        (?P<header>                 # header: ' q.w.e.asd '
-        ((?P<base>[^:]+)\.)?        # base: ' q.w.e'
-        (?P<head>[^:\.]+)           # head: 'asd '
-        )
+        (?P<header>\s*              # header: ' q.w.e.asd '
+        ((?P<base>[^:\s]+)\.)?      # base: ' q.w.e'
+        (?P<head>[^:\s\.]*)         # head: 'asd '
+        \s*)
         (:(?P<inherit>.*))?         # inherit: ' b,c,d'
         \]
         """
@@ -173,6 +173,7 @@ class Lekvar(RawConfigParser):
         if (i := section.rfind(".")) == -1:
             self._inherit_bw[section].appendleft(self.default_section)
             self._inherit_fw[self.default_section].append(section)
+            # TODO: this makes ":" inheritance order unintuitive
         else:
             head = section[:i]
             if head not in self._sections:
@@ -354,7 +355,9 @@ class Lekvar(RawConfigParser):
                 if mo := self.SECTCRE.match(value):
                     header, base, head, inherit = mo.group('header', 'base', 'head', 'inherit')
                     header = header.strip()
-                    if header == self.default_section:
+                    if header == "":
+                        raise MissingSectionHeaderError(fpname, lineno, line)
+                    elif header == self.default_section:
                         curproxy = self._proxies[self.default_section]
                         sectname = ''
                         if inherit != None: 
@@ -366,8 +369,15 @@ class Lekvar(RawConfigParser):
                         elements_added.add(sectname)
 
                         if inherit is not None:
+                            if inherit.isspace():
+                                e = self._handle_error(e, fpname, lineno, line)
+                                continue
+
                             inherit_from = [i.strip() for i in inherit.split(",")]
                             for inh in inherit_from:
+                                if inh == "":
+                                    e = self._handle_error(e, fpname, lineno, line)
+                                    continue
                                 self._inherit_bw[header].append(inh)
                                 self._inherit_fw[inh].append(header)
 
@@ -399,8 +409,9 @@ class Lekvar(RawConfigParser):
                 elif mo := self.INCLCRE.match(value):
                     if not (opt_name := mo.group("rename")):
                         opt_name = mo.group("head")
-                        
+                    
                     self._sections[sectname].dict_1[opt_name] = mo.group("option")
+
 
                 elif mo := self.RENCRE.match(value):
                     self._renames[sectname][mo.group("option")] = mo.group("rename")
