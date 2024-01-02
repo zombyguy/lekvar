@@ -1,6 +1,8 @@
 name: Publish Python 🐍 distribution 📦 to TestPyPI
 
-on: push
+on: 
+  release:
+    types: [created]
 
 jobs:
   build:
@@ -36,7 +38,7 @@ jobs:
 
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/<package-name>
+      url: https://test.pypi.org/p/lekvar
 
     permissions:
       id-token: write  # IMPORTANT: mandatory for trusted publishing
