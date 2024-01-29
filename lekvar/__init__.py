@@ -1,3 +1,3 @@
 from .lekvar import Lekvar
 
-from .composemap import ComposeMap, ComposeMutMap
+from .containers import ComposeMap, ComposeMutMap, noset

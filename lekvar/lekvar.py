@@ -20,8 +20,8 @@ from configparser import (
 )
 from collections import ChainMap, defaultdict, deque
 from collections.abc import ItemsView
-from .composemap import ComposeMutMap
-from typing import Any, TextIO
+from .containers import ComposeMutMap, noset
+from typing import Any, Iterator, TextIO, Callable
 import sys
 import re
 import warnings
@@ -30,6 +30,7 @@ class SectionInheritanceError(Error): ...
 
 class DuplicateWarning(Warning): ...
 
+    
 class Lekvar(RawConfigParser):
     _SECT_TMPL = r"""
         \[                          # ex.: [ q.w.e.asd : b,c,d]
@@ -96,7 +97,7 @@ class Lekvar(RawConfigParser):
             delimiters = delimiters,
             comment_prefixes = comment_prefixes, 
             inline_comment_prefixes = inline_comment_prefixes,
-            strict = strict, #numbers cast to true, except 0, so this matches the inherited behaviour
+            strict = strict, #numbers cast to true, except 0, so this matches the inherited behaviour # type: ignore
             empty_lines_in_values = empty_lines_in_values,
             default_section = default_section,
             interpolation = interpolation, 
@@ -109,7 +110,7 @@ class Lekvar(RawConfigParser):
         #  2 - adding the same option for a section is not allowed (a.k.a overwriting)
         #  3 - adding the same section is not allowed
 
-        self._added_in_current_file = set()
+        self._added_in_current_file = noset()
 
         self._all_options = self._dict()
         self._defaults: ComposeMutMap = ComposeMutMap(self._dict(), self._all_options)
@@ -446,6 +447,7 @@ class Lekvar(RawConfigParser):
                     # list of all bogus lines
                     e = self._handle_error(e, fpname, lineno, line)
         self._join_multiline_values()
+        self._added_in_current_file = noset()
         # if any parsing errors occurred, raise an exception
         if e:
             raise e
