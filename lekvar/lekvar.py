@@ -20,14 +20,17 @@ from configparser import (
 )
 from collections import ChainMap, defaultdict, deque
 from collections.abc import ItemsView
-from .composemap import ComposeMutMap
-from typing import Any, TextIO
+from .containers import ComposeMutMap, noset
+from typing import Any, Iterator, TextIO, Callable
 import sys
 import re
 import warnings
 
 class SectionInheritanceError(Error): ...
 
+class DuplicateWarning(Warning): ...
+
+    
 class Lekvar(RawConfigParser):
     _SECT_TMPL = r"""
         \[                          # ex.: [ q.w.e.asd : b,c,d]
@@ -85,7 +88,7 @@ class Lekvar(RawConfigParser):
     def __init__(self, defaults=None, dict_type=_default_dict,
                  allow_no_value=False, *, delimiters=('=', ':'),
                  comment_prefixes=('#', ';'), inline_comment_prefixes=None,
-                 strict=True, empty_lines_in_values=True,
+                 strict=1, empty_lines_in_values=True,
                  default_section=DEFAULTSECT,
                  interpolation=_UNSET, converters=_UNSET):
         
@@ -94,13 +97,21 @@ class Lekvar(RawConfigParser):
             delimiters = delimiters,
             comment_prefixes = comment_prefixes, 
             inline_comment_prefixes = inline_comment_prefixes,
-            strict = strict, 
+            strict = strict, #numbers cast to true, except 0, so this matches the inherited behaviour # type: ignore
             empty_lines_in_values = empty_lines_in_values,
             default_section = default_section,
             interpolation = interpolation, 
             converters = converters)
         # TODO: maybe should just initialize it myself
         
+        # strictness levels:
+        #  0 - everything is allowed
+        #  1 - reading the same paramteter in the same file is not allowed
+        #  2 - adding the same option for a section is not allowed (a.k.a overwriting)
+        #  3 - adding the same section is not allowed
+
+        self._added_in_current_file = noset()
+
         self._all_options = self._dict()
         self._defaults: ComposeMutMap = ComposeMutMap(self._dict(), self._all_options)
         self._sections: dict[str, ComposeMutMap] = self._dict()
@@ -159,12 +170,19 @@ class Lekvar(RawConfigParser):
                         del sect_dict[opt]
 
 
-    def add_section(self, section: str):
+    def add_section(self, section: str, source: str | None = None, lineno: int | None = None):
         if section == self.default_section:
             raise ValueError('Invalid section name: %r' % section)
 
+        if self._strict >= 1 and section in self._added_in_current_file: 
+            raise DuplicateSectionError(section, source, lineno)
+        
         if section in self._sections:
-            raise DuplicateSectionError(section)
+            if self._strict == 3: 
+                raise DuplicateSectionError(section)
+            else: 
+                warnings.warn(f"Section '{section}' was added again. Some values may get overwritten.", DuplicateWarning)
+                return
 
         self._sections[section] = ComposeMutMap(self._dict(), self._all_options)
         self._proxies[section] = SectionProxy(self, section)
@@ -176,7 +194,7 @@ class Lekvar(RawConfigParser):
         else:
             head = section[:i]
             if head not in self._sections:
-                self.add_section(head)
+                self.add_section(head, source, lineno)
             self._inherit_bw[section].appendleft(head)
             self._inherit_fw[head].append(section)
 
@@ -251,7 +269,7 @@ class Lekvar(RawConfigParser):
     
     def set(self, section, option, value=None, in_read = False):
         # TODO: interpolation
-                
+
         if not section or section == self.default_section:
             sectdict = self._defaults
             section = ''
@@ -260,15 +278,23 @@ class Lekvar(RawConfigParser):
                 sectdict = self._sections[section]
             except KeyError:
                 raise NoSectionError(section) from None
-        
+
+        if self._strict >= 1 and (section, option) in self._added_in_current_file:
+            raise DuplicateOptionError(section, option)
+
         rel_opt = self.optionxform(option.strip())
         abs_opt = f"{section}.{rel_opt}"
+
+        if self._strict >= 2 and abs_opt in self._all_options:
+            raise DuplicateOptionError(section, option)
+
+        self._added_in_current_file.add((section, option))
 
         sectdict.dict_1[rel_opt] = abs_opt
         if value == None:
             sectdict.dict_2[abs_opt] = None
         else:
-            sectdict.dict_2[abs_opt] = value if not in_read else [value]
+            sectdict.dict_2[abs_opt] = value if not in_read else [value] # because in files the val can be multiline
         
     def write(self, fp, space_around_delimiters=True):
         # TODO: writing is tricky
@@ -297,7 +323,7 @@ class Lekvar(RawConfigParser):
 
 
     def _read(self, fp: TextIO, fpname: str):
-        elements_added = set()
+        self._added_in_current_file = set()
         curproxy: SectionProxy | None = None
         sectname = None
         to_sect = None
@@ -361,9 +387,9 @@ class Lekvar(RawConfigParser):
                             raise SectionInheritanceError("Default section cannot inherit.")
                     else: 
                         sectname = header
-                        self.add_section(sectname)
+                        self.add_section(sectname, fpname, lineno)
                         curproxy = self._proxies[sectname]
-                        elements_added.add(sectname)
+                        self._added_in_current_file.add(sectname)
 
                         if inherit is not None:
                             inherit_from = [i.strip() for i in inherit.split(",")]
@@ -384,16 +410,18 @@ class Lekvar(RawConfigParser):
                     if to_head is not None:
                         to_sect = f"{sectname}.{to_head.strip()}"
                         if to_sect not in self._sections:
-                            self.add_section(to_sect)
+                            self.add_section(to_sect, fpname, lineno)
                     else: 
                         to_sect = sectname
                     optname = self.optionxform(optname.rstrip())
-                    if (self._strict and
-                        (to_sect, optname) in elements_added):
-                        raise DuplicateOptionError(to_sect, optname,
-                                                    fpname, lineno)
-                    elements_added.add((to_sect, optname))
-                    self.set(to_sect, optname, optval, True)
+                    # if (self._strict >= 1 and
+                    #     (to_sect, optname) in self._added_in_current_file):
+                    #     raise DuplicateOptionError(to_sect, optname,
+                    #                                 fpname, lineno)
+                    # self._added_in_current_file.add((to_sect, optname))
+                    try: self.set(to_sect, optname, optval, True)
+                    except DuplicateOptionError as exc: 
+                        raise DuplicateOptionError(to_sect, optname, fpname, lineno) from None
                     # TODO: value type parsing
 
                 elif mo := self.INCLCRE.match(value):
@@ -419,6 +447,7 @@ class Lekvar(RawConfigParser):
                     # list of all bogus lines
                     e = self._handle_error(e, fpname, lineno, line)
         self._join_multiline_values()
+        self._added_in_current_file = noset()
         # if any parsing errors occurred, raise an exception
         if e:
             raise e

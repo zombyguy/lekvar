@@ -1,5 +1,5 @@
-from typing import Iterator, TypeVar
-from collections.abc import MutableMapping, Mapping
+from typing import Iterator, TypeVar, Any
+from collections.abc import MutableMapping, Mapping, MutableSet
 
 _KT = TypeVar("_KT")
 _MT = TypeVar("_MT")
@@ -32,3 +32,23 @@ class ComposeMutMap(ComposeMap):
         super().__init__(dict_1, dict_2)
         self.dict_1: MutableMapping
         self.dict_2: MutableMapping
+
+class noset(MutableSet):
+    """
+    Simple set-like class which doesn't retain any items.
+    """
+    # TODO: might be able to remove in_read with isinstance with this
+    def __contains__(self, x: object) -> bool:
+        return False
+    def __len__(self) -> int:
+        return 0
+    def __iter__(self) -> Iterator:
+        return zip()
+    def add(self, value: Any) -> None:
+        pass
+    def discard(self, value: Any) -> None:
+        pass
+    def __repr__(self) -> str:
+        return "noset()"
+    def __str__(self) -> str:
+        return "noset()"
